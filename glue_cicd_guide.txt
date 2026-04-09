@@ -1,0 +1,168 @@
+GLUE CI/CD WITH TERRAFORM + GITHUB ACTIONS (DEV & QA IN SAME AWS ACCOUNT)
+
+PREREQUISITES
+
+-   GitHub account
+-   VS Code on Windows
+-   Terraform installed
+-   AWS Free Tier account
+-   AWS CLI configured locally
+
+STEP 1: CREATE GITHUB REPOSITORY
+
+Create repo: glue-cicd-demo
+
+Folder structure:
+
+glue-cicd-demo/ 
+├── modules/ 
+│ └── glue-job/ 
+│ ├── main.tf 
+│ ├──variables.tf 
+│ └── outputs.tf 
+├── envs/ 
+│ ├── dev/ 
+│ │ ├── main.tf 
+│ │ ├── backend.tf 
+│ │ ├── variables.tf 
+│ │ └── terraform.tfvars 
+│ └── qa/ 
+│ ├── main.tf │ ├── backend.tf │ ├── variables.tf │ └── terraform.tfvars
+├── glue-scripts/ │ ├── dev/ │ │ └── hello_glue.py │ └── qa/ │ └──
+hello_glue.py └── .github/ └── workflows/ ├── deploy-dev.yml └──
+deploy-qa.yml
+
+STEP 2: IAM SETUP IN AWS
+
+Create IAM Role: glue-cicd-role
+
+Attach policies: - AWSGlueServiceRole - AmazonS3FullAccess -
+CloudWatchLogsFullAccess
+
+Trust policy should allow: Service: glue.amazonaws.com
+
+Note ARN of role for Terraform.
+
+STEP 3: HELLO WORLD GLUE SCRIPT
+
+glue-scripts/dev/hello_glue.py
+
+import sys from awsglue.utils import getResolvedOptions
+
+args = getResolvedOptions(sys.argv, [‘ENV_NAME’, ‘MESSAGE’])
+print(“Hello from Glue!”) print(“Environment:”, args[‘ENV_NAME’])
+print(“Message:”, args[‘MESSAGE’])
+
+Same file for QA, only folder changes.
+
+STEP 4: TERRAFORM MODULE FOR GLUE JOB
+
+modules/glue-job/main.tf
+
+resource “aws_glue_job” “this” { name = var.job_name role_arn =
+var.role_arn
+
+command { name = “glueetl” script_location = var.script_location
+python_version = “3” }
+
+default_arguments = { “–ENV_NAME” = var.env_name “–MESSAGE” =
+var.message }
+
+glue_version = “4.0” number_of_workers = 2 worker_type = “G.1X” }
+
+variables.tf
+
+variable “job_name” {} variable “role_arn” {} variable “script_location”
+{} variable “env_name” {} variable “message” {}
+
+outputs.tf
+
+output “job_name” { value = aws_glue_job.this.name }
+
+STEP 5: ENV SETUP (DEV)
+
+envs/dev/main.tf
+
+provider “aws” { region = “ap-south-1” }
+
+module “glue_job” { source = “../../modules/glue-job” job_name =
+“hello-glue-dev” role_arn = var.role_arn script_location =
+var.script_location env_name = “DEV” message = “Hello from DEV
+environment” }
+
+variables.tf
+
+variable “role_arn” {} variable “script_location” {}
+
+terraform.tfvars
+
+role_arn = “arn:aws:iam:::role/glue-cicd-role” script_location =
+“s3://your-bucket/dev/hello_glue.py”
+
+backend.tf
+
+terraform { backend “s3” { bucket = “your-tf-state-bucket” key =
+“glue/dev/terraform.tfstate” region = “ap-south-1” } }
+
+STEP 6: ENV SETUP (QA)
+
+Same as dev but change:
+
+job_name = “hello-glue-qa” env_name = “QA” message = “Hello from QA
+environment” state key = “glue/qa/terraform.tfstate” script_location =
+“s3://your-bucket/qa/hello_glue.py”
+
+STEP 7: UPLOAD SCRIPTS TO S3
+
+Create bucket: glue-cicd-scripts-yourname
+
+Upload: - glue-scripts/dev/hello_glue.py →
+s3://bucket/dev/hello_glue.py - glue-scripts/qa/hello_glue.py →
+s3://bucket/qa/hello_glue.py
+
+STEP 8: TEST LOCALLY
+
+cd envs/dev terraform init terraform plan terraform apply
+
+Repeat for QA.
+
+STEP 9: GITHUB SECRETS
+
+In repo settings → Secrets:
+
+AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION
+
+STEP 10: GITHUB ACTION FOR DEV
+
+.github/workflows/deploy-dev.yml
+
+name: Deploy Dev
+
+on: push: branches: [ “dev” ] paths: - “envs/dev/” - ”modules/”
+
+jobs: deploy: runs-on: ubuntu-latest steps: - uses:
+actions/checkout@v3 - uses: hashicorp/setup-terraform@v3 - run:
+terraform init working-directory: envs/dev - run: terraform apply
+-auto-approve working-directory: envs/dev env: AWS_ACCESS_KEY_ID: ${{
+secrets.AWS_ACCESS_KEY_ID }} AWS_SECRET_ACCESS_KEY: ${{
+secrets.AWS_SECRET_ACCESS_KEY }} AWS_REGION: ${{ secrets.AWS_REGION }}
+
+STEP 11: GITHUB ACTION FOR QA
+
+Same as dev but: - Branch: qa - Working directory: envs/qa
+
+STEP 12: WORKFLOW
+
+-   Push to dev branch → deploys DEV Glue job
+-   Push to qa branch → deploys QA Glue job
+-   Run Glue job manually and see logs in CloudWatch: Hello from Glue!
+    Environment: DEV / QA Message: Hello from DEV environment / QA
+    environment
+
+YOU HAVE NOW:
+
+-   Git version control
+-   Terraform IaC
+-   GitHub Actions CI/CD
+-   Dev & QA separation
+-   Glue job with env-specific parameters

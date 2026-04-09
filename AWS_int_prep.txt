@@ -1,0 +1,1473 @@
+AWS concepts --
+
+lakehouse principles -
+Separate scalable Compute plus Storage layer
+supprts varios data formats
+supports ACID
+zero ETL
+AI/ML supports
+
+Ingestion layer - raw as is from source
+Storage layer - parquet format etc
+Metadata layer - acid transactions etc
+API layer - front end access
+Semantic layer - The semantic layer is the topmost layer of the data lakehouse. Also known as the data consumption layer, it consists of data analytics tools
+
+------------------------------------
+SageMaker - unifies all the data on simple storage service (s3) datalake & tables, Redshift datawarehouse
+Amazon Redshift supports zero-ETL integration
+amazon RDS/Aurora is a relational database management system
+amazon quicksight BI on aws
+S3 - archival, data lake, backup and restore data
+---------------------------------
+
+Glue -
+a serverless data integration service
+ELT, ETL
+like ADF but core pyspark engine
+less orchestration capabilities, need to use step function for orchestration.
+
+70+ data sources connectors
+centralized data catalog
+
+
+Data Catalog: A metadata store containing table definitions, job definitions, and other control information for your ETL workflows.
+Crawlers: Programs that connect to data sources, infer data schemas, and create metadata table definitions in the Data Catalog.
+ETL Jobs: The business logic to extract data from sources, transform it using Apache Spark scripts, and load it into targets.
+Triggers: Mechanisms to initiate job runs based on schedules or events.
+
+The typical workflow involves:
+Define data sources and targets in the Data Catalog.
+Use Crawlers to populate the Data Catalog with table metadata from data sources.
+Define ETL jobs with transformation scripts to move and process data.
+Run jobs on-demand or based on triggers.
+Monitor job performance using dashboards.
+
+You are charged an hourly rate based on the number of Data Processing Units (or DPUs) used to run your ETL job. A single Data Processing Unit (DPU) is also referred to as a worker. 
+
+Parse JSON data from Amazon Simple Storage Service (Amazon S3) source files to Amazon Relational Database Service (Amazon RDS) tables, using glue catalog on the fly.
+
+using dynamicFrame vs dataframe - using choicetype, resolve type.
+---------------
+
+---
+glue usecase example - 
+
+Source (CSV/JSON/Parquet)
+   ↓
+S3 Bronze  →  Glue Crawler  →  Glue Data Catalog
+   ↓
+Glue ETL (Spark)
+   ↓
+S3 Silver (Iceberg tables)
+   ↓
+Glue ETL / Athena
+   ↓
+S3 Gold (Iceberg, analytics-ready)
+
+Why this matters for DE roles - 
+Scalable ingestion
+Schema evolution
+ACID tables
+Query via Athena / Spark
+Production-grade data lake
+--------
+
+step by step - 
+1) bronze layer raw data - 
+s3://de-lake/bronze/orders/2025/01/orders.csv
+
+Glue Crawler - 
+Source: s3://de-lake/bronze/orders/
+Output DB: bronze_db
+Schedule: hourly / daily
+
+raw data query on athena
+SELECT *
+FROM bronze_db.orders
+LIMIT 10;
+----------------------
+2) silver layer -
+glu spark job - 
+
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+bronze_df = spark.read.table("bronze_db.orders")
+silver_df = (
+    bronze_df
+    .filter("order_status IS NOT NULL")
+    .withColumnRenamed("orderDate", "order_date")
+)
+silver_df.writeTo("glue_catalog.silver_db.orders") \
+    .using("iceberg") \
+    .tableProperty("format-version", "2") \
+    .partitionedBy("order_date") \
+    .createOrReplace()
+	----------------
+---- for merging daily loads--
+daily_df = spark.read.table("bronze_db.orders") \
+    .filter("ingest_date = current_date()")
+
+daily_df.createOrReplaceTempView("daily_orders")
+
+MERGE INTO silver_db.orders t
+USING daily_orders s
+ON t.order_id = s.order_id
+
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+	
+| format-version | Use Case                            |
+| ------- | ----------------------------------- |
+| 1       | Append-only tables                  |
+| 2       | Upserts, CDC, deletes (recommended) |
+	
+| Method                  | Use case                      |
+| ----------------------- | ----------------------------- |
+| `create()`              | Create only (fails if exists) |
+| `createOrReplace()`     | Dev / rebuild                 |
+| `append()`              | Incremental loads             |
+| `overwritePartitions()` | Daily partition refresh       |
+| `overwrite()`           | Full refresh (careful)        |
+
+| Property                       | Purpose                   |
+| ------------------------------ | ------------------------- |
+| `write.format.default`         | parquet / avro            |
+| `write.target-file-size-bytes` | file sizing (512MB ideal) |
+| `write.distribution-mode`      | hash / range              |
+| `commit.retry.num-retries`     | fault tolerance           |
+
+	
+this supports schema evolution - 
+--ALTER TABLE silver_db.orders
+ADD COLUMN discount_amount double;
+--silver_df = silver_df.withColumn("discount", lit(0.0))
+
+0-- supports time travel
+SELECT *
+FROM silver_db.orders
+FOR TIMESTAMP AS OF TIMESTAMP '2025-01-01 10:00:00';
+
+-----------
+3) gold layer
+
+gold_df = spark.sql("""
+SELECT
+  order_date,
+  SUM(order_amount) AS daily_revenue
+FROM silver_db.orders
+GROUP BY order_date
+""")
+gold_df.writeTo("glue_catalog.gold_db.daily_revenue") \
+    .using("iceberg") \
+    .createOrReplace()
+
+--
+| Tool   | Use case                   |
+| ------ | -------------------------- |
+| Glue   | Serverless ETL             |
+| EMR    | Custom Spark, tuning-heavy |
+| Lambda | Small transforms only      |
+
+-----
+
+#	order_id	customer_id	order_amount	order_date	order_status	updated_at	discount_amount
+1	3	103	560.75	2025-01-03	SHIPPED		
+2	2	102	120.0	2025-01-02	PENDING		
+3	1	101	250.5	2025-01-01	CONFIRMED		
+
+new data 
+order_id,customer_id,order_amount,order_date,order_status,updated_at
+1,101,750.50,2025-01-01,SHIPPED,2025-01-04 10:00:00
+4,102,120.00,2025-01-01,PENDING,2025-01-05 11:30:00
+
+
+upserted data
+#	order_id	customer_id	order_amount	order_date	order_status	updated_at	discount_amount
+1	2	102	120.0	2025-01-02	PENDING		
+2	1	101	750.5	2025-01-01	SHIPPED	2025-01-01 10:00:00.000000 UTC	
+3	4	102	120.0	2025-01-05	PENDING	2025-01-05 11:30:00.000000 UTC	
+4	3	103	560.75	2025-01-03	SHIPPED		
+
+----
+
+SELECT * FROM "silver_db"."orders$partitions";
+
+partition#	partition	record_count	file_count	total_size	data
+1	{order_date=null}	2	2	3556	{order_id={min=null, max=null, null_count=2, nan_count=null}, customer_id={min=null, max=null, null_count=2, nan_count=null}, order_amount={min=null, max=null, null_count=2, nan_count=0}, order_status={min=order_status, max=order_status, null_count=0, nan_count=null}, updated_at={min=null, max=null, null_count=2, nan_count=null}, discount_amount={min=null, max=null, null_count=2, nan_count=0}}
+2	{order_date=2025-01-05}	1	1	1979	{order_id={min=4, max=4, null_count=0, nan_count=null}, customer_id={min=102, max=102, null_count=0, nan_count=null}, order_amount={min=120.0, max=120.0, null_count=0, nan_count=0}, order_status={min=PENDING, max=PENDING, null_count=0, nan_count=null}, updated_at={min=2025-01-05 11:30:00.000000 UTC, max=2025-01-05 11:30:00.000000 UTC, null_count=0, nan_count=null}, discount_amount={min=null, max=null, null_count=1, nan_count=0}}
+3	{order_date=2025-01-03}	1	1	1915	{order_id={min=3, max=3, null_count=0, nan_count=null}, customer_id={min=103, max=103, null_count=0, nan_count=null}, order_amount={min=560.75, max=560.75, null_count=0, nan_count=0}, order_status={min=SHIPPED, max=SHIPPED, null_count=0, nan_count=null}, updated_at={min=null, max=null, null_count=1, nan_count=null}, discount_amount={min=null, max=null, null_count=1, nan_count=0}}
+4	{order_date=2025-01-02}	1	1	1915	{order_id={min=2, max=2, null_count=0, nan_count=null}, customer_id={min=102, max=102, null_count=0, nan_count=null}, order_amount={min=120.0, max=120.0, null_count=0, nan_count=0}, order_status={min=PENDING, max=PENDING, null_count=0, nan_count=null}, updated_at={min=null, max=null, null_count=1, nan_count=null}, discount_amount={min=null, max=null, null_count=1, nan_count=0}}
+5	{order_date=2025-01-01}	1	1	1979	{order_id={min=1, max=1, null_count=0, nan_count=null}, customer_id={min=101, max=101, null_count=0, nan_count=null}, order_amount={min=750.5, max=750.5, null_count=0, nan_count=0}, order_status={min=SHIPPED, max=SHIPPED, null_count=0, nan_count=null}, updated_at={min=2025-01-01 10:00:00.000000 UTC, max=2025-01-01 10:00:00.000000 UTC, null_count=0, nan_count=null}, discount_amount={min=null, max=null, null_count=1, nan_count=0}}
+
+
+-------------------------------------------------
+--
+
+Glu Bookmarks – Incremental Processing (Very Important) - disbabled by default
+What bookmarks do
+Track processed files/partitions
+Prevent reprocessing
+--
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)  # Initialize bookmark service
+job.init(args['JOB_NAME'], args)
+# S3 source with bookmark (tracks new files via transformation_ctx)
+datasource0 = glueContext.create_dynamic_frame.from_catalog(
+    database="hr",
+    table_name="emp",
+    transformation_ctx="datasource0"  # Enables bookmark for this step -- must if we want bookmarking
+)
+# Apply mapping (bookmark tracks transformed state)
+applymapping1 = ApplyMapping.apply(frame=datasource0, transformation_ctx="applymapping1")
+# Write to S3 sink (bookmark updates on commit)
+datasink2 = glueContext.write_dynamic_frame.from_options(
+    frame=applymapping1,
+    connection_type="s3",
+    connection_options={"path": "s3://hr/employees/"},
+    format="parquet",
+    transformation_ctx="datasink2"
+)
+job.commit()  # Persists bookmark state
+
+--
+ disbaling for one time load--
+ 
+aws glue start-job-run \
+  --job-name my-backfill-job \
+  --arguments='{"--job-bookmark-option": "disable"}'
+
+ | Action                        | Effect                                         | Use Case                                             |
+| ----------------------------- | ---------------------------------------------- | ---------------------------------------------------- |
+| reset-job-bookmark            | Clears state first 							 | One-time backfill then resume increments             |
+| --job-bookmark-option disable | Ignores state entirely                         | Repeated full processing (testing, data corrections) |
+
+| Case | Bookmark | Overwrite | Result                |
+| ---- | -------- | --------- | --------------------- |
+| A    | ENABLED  | OVERWRITE | ❌ Partial data wipe   |
+| B    | DISABLED | OVERWRITE | ✅ Correct full load   |
+| C    | ENABLED  | APPEND    | ✅ Incremental load    |
+| D    | DISABLED | APPEND    | ❌ Duplicate explosion |
+
+When to use
+S3 incremental loads
+Append-only Bronze
+
+When NOT to use
+MERGE-based pipelines
+CDC streams
+📌 CDC pipelines should be idempotent, not bookmark-driven
+
+Do you need UPDATE / DELETE / MERGE?
+ ├─ NO → Plain Parquet
+ └─ YES
+     ├─ Multi-engine access? → Iceberg
+     ├─ Databricks-only? → Delta Lake
+     ├─ Streaming CDC focus? → Hudi
+
+
+
+-----------------
+AWS DataSync is an online data transfer service that simplifies, automates, and accelerates moving data between on-premises storage systems and AWS storage services, 
+Bulk migration & sync
+
+aws transfer family
+User/partner file transfer for big files
+
+-------------------
+
+aws lambda - for triggering glue etl jobs - event triggers
+
+-=----
+Amazon Data Firehose is part of the Kinesis family of services that makes it easy to collect, process, and analyze real-time streaming data at any scale. Firehose is a fully managed service for delivering real-time streaming data directly to data lakes (Amazon S3), data stores, and analytical services for further processing
+
+
+| Dimension     | Redshift                             | Athena                            | RDS / Aurora            |
+| ------------- | ------------------------------------ | --------------------------------- | ----------------------- |
+| Primary role  | Data warehouse / analytics           | SQL over data lake (S3)           | OLTP database           |
+| Storage model | Columnar in cluster + Spectrum on S3 | Files in S3 (schema‑on‑read)      | Row‑store in engine     |
+| Compute       | Provisioned or serverless MPP        | Fully serverless                  | Provisioned instances   |
+| Pricing       | Based on warehouse capacity / RPU    | Per TB scanned per query          | Per instance + I/O      |
+| Workload fit  | Complex BI, large joins              | Ad‑hoc, exploratory, log analysis | Transactions, CRUD APIs |
+
+| Aspect     | AWS Glue                                   | Amazon EMR                                     |
+| ---------- | ------------------------------------------ | ---------------------------------------------- |
+| Core model | Fully serverless ETL (Spark under hood)    | Managed clusters (Hadoop, Spark, Hive, Presto) |
+| Management | No infra; auto-scales DPUs                 | Provision/scale clusters (or EMR Serverless)   |
+| Pricing    | Per DPU-hour (~$0.44/hr)                   | EC2 instance costs + EMR fee                   |
+| Best for   | Quick ETL, cataloging, data prep trianz+1​ | Custom big data apps, ML, streaming trianz+1​  |
+
+| Service   | Primary purpose                                                      | Key workload type                                                       |
+| --------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| SageMaker | End-to-end ML platform (notebooks, training, deployment, monitoring) | Model training, inference endpoints, data prep for AI byteplus+1​       |
+| Lambda    | Serverless compute for event-driven code                             | Short tasks (<15min), APIs, lightweight ETL/inference byteplus​youtube​ |
+| EMR       | Managed Hadoop/Spark clusters                                        | Batch/stream big data processing, Spark jobs stackoverflow​youtube​     |
+
+
+| Feature        | DynamoDB                        | DocumentDB                                         |
+| -------------- | ------------------------------- | -------------------------------------------------- |
+| Data Model     | Key-value & JSON documents      | BSON/JSON documents (MongoDB-like) k21academy+1​   |
+| Scaling        | Fully automatic, serverless     | Manual read replicas, instance-based k21academy+1​ |
+| Query Language | PartiQL, scans, indexes         | MongoDB APIs & aggregation stackoverflow+1​        |
+| Consistency    | Eventual/strong reads           | Strong consistency k21academy​                     |
+| Max Storage    | Virtually unlimited (petabytes) | Up to 64 TiB dynobase+1​                           |
+
+
+--------------
+| Source dataset        | File type | Target DB                                  |
+| --------------------- | --------- | ------------------------------------------ |
+| **app_usage_events**  | JSON      | **Amazon Redshift** (analytics)            |
+| **customer_profiles** | CSV       | **Amazon Aurora (Postgres)** (operational) |
+
+
+S3 (Bronze)
+ ├── app_usage_events/     (JSON)
+ └── customer_profiles/   (CSV)
+        │
+        ▼
+Lambda (Router)
+- Detect dataset
+- Load config
+- Trigger Glue
+        │
+        ▼
+Glue (Generic Bronze → Silver)
+- Read config
+- Apply schema
+- Incremental ingest
+        │
+        ├── Silver S3 (Parquet)
+        │
+        ├── Redshift (COPY)
+        └── Aurora Postgres (JDBC)
+
+----------------
+
+-- some interview questions
+
+1)With watermark ✅
+MERGE INTO iceberg_db.orders t
+USING (
+    SELECT *
+    FROM staging.orders
+    WHERE updated_at > TIMESTAMP '2025-01-01 00:00:00'
+) s
+ON t.order_id = s.order_id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+
+2)
+Scenario: Glue job is slow when processing many small files.
+
+Answer:
+Small file problem
+Use S3 compaction (Spark coalesce / repartition)
+Write fewer, larger files (128–512 MB)
+
+3) dpu worker relation - 
+for slow jobs , increase dpu/workers
+
+A DPU (Data Processing Unit) is the unit of compute used by AWS Glue.
+
+1 DPU =
+4 vCPU
+16 GB RAM
+
+| Worker Type | vCPU | Memory | Approx DPUs |
+| ----------- | ---- | ------ | ----------- |
+| **G.1X**    | 4    | 16 GB  | **1 DPU**   |
+| **G.2X**    | 8    | 32 GB  | **2 DPUs**  |
+| **G.4X**    | 16   | 64 GB  | **4 DPUs**  |
+| **G.8X**    | 32   | 128 GB | **8 DPUs**  |
+
+
+Worker Type = G.2X
+Number of Workers = 10
+Total DPUs = 10 × 2 = 20 DPUs
+
+4) data type mismatch in data processed by crawler
+
+Fix using by attaching well schema defined custom classifiers to crawler
+OR define schema manually in Glue Data Catalog table defintion at the time of table creation
+
+
+5) Predicate pushdown
+filter first then apply transform
+use parquet file format
+
+partition pruning - filter only required partition for read/write
+
+6) 
+--conf spark.sql.shuffle.partitions=240
+--conf spark.sql.adaptive.enabled=true
+--conf spark.sql.adaptive.skewJoin.enabled=true
+--conf spark.sql.files.maxPartitionBytes=64m
+--conf spark.sql.files.openCostInBytes=4m
+--conf spark.sql.autoBroadcastJoinThreshold=50MB
+
+
+7) Scenario: Lambda times out processing large S3 files. (> 500 mb)
+
+Answer:
+Lambda has 15-minute max
+
+8) use relevant storage class for s3
+| Data Type                | Storage Class               | Cost   | Access        |
+| ------------------------ | --------------------------- | ------ | ------------- |
+| Hot / frequently queried | **S3 Standard**             | 💰💰💰 | ms            |
+| Warm / occasional        | **S3 Intelligent-Tiering**  | 💰💰   | ms            |
+| Cold / infrequent        | **S3 Standard-IA**          | 💰     | ms            |
+| Very cold                | **S3 Glacier Instant**      | 💰     | ms            |
+| Archive                  | **S3 Glacier Flexible**     | 💸     | minutes–hours |
+| Deep archive             | **S3 Glacier Deep Archive** | 💸💸   | hours         |
+
+9)Scenario: Data accidentally deleted from S3.
+Enable Versioning
+
+10)Athena query returns inconsistent results.
+
+Schema evolution issues
+Old partitions not repaired
+Run MSCK REPAIR TABLE or Iceberg metadata refresh
+
+11) Scenario: Athena vs Redshift – when Athena?
+
+Athena:
+Ad-hoc queries
+Low concurrency
+Serverless
+
+Redshift:
+High concurrency
+BI dashboards
+Complex joins
+
+12)
+Athena with Iceberg benefits?
+
+Answer:
+ACID transactions
+Time travel
+Schema evolution
+Faster metadata operations
+
+13) Why Iceberg over Hive tables?
+Answer:
+No data corruption
+TIME TRAVEL support
+Snapshot isolation - data seen after commit 
+Hidden partitions
+Schema evolution -- add column , reorder column etc
+
+14) Fine-grained access on tables.
+
+Answer:
+Use Lake Formation:
+Column-level access
+Row-level filtering
+Central governance
+
+15) aws lakehouse formation 
+---
+Step 2: Set Up Lake Formation
+Register S3 buckets with Lake Formation:
+Go to AWS Lake Formation → Data Lake Locations → Register Location
+Register s3://my-lakehouse
+
+Create IAM role for Glue & Athena with Lake Formation permissions
+
+16) Schema Drift Breaks Glue Jobs
+
+Use Iceberg / Hudi schema evolution
+--spark.read.option("mergeSchema", "true")
+
+---
+project specific - retail banking
+
+customer channel wise transactions - netbanking, atm, branch -  transactional data
+customer risk profile updates / kyc status updates - merge upsert
+
+AWS DE interview prep pointers
+
+- medallion architecture layer wise usage (know why and when)
+>>>>>source to bronze 
+from system s3 to lakehouse s3
+s3://banking-bronze/customer/source=crm/ingestion_date=2025-01-05/
+
+What Bronze data looks like
+Raw, source-aligned data
+Stored as-is, no business logic applied
+
+Formats:
+JSON (API payloads)
+CSV (legacy batch extracts)
+
+Partitioned by:
+ingestion_date
+source_system
+
+“Bronze is an immutable, source-aligned layer used for auditability, replay, and failure isolation.”
+
+>>>>>>Bronze → Silver
+Transformations & Cleansing
+Purpose of Silver Layer
+Silver is the cleaned, standardized, and conformed representation of data.
+
+
+casting
+txn_amount → cast to DECIMAL(18,2)
+transaction_ts → cast to TIMESTAMP
+
+Null checks on critical fields:
+customer_id
+account_id
+
+De-duplication
+
+>>>>>> silver to gold
+
+Gold is business-curated, aggregated, and use-case specific.
+
+aggregation-
+Monthly spending patterns
+Business rules
+
+Apply domain logic:
+
+Active vs inactive customers
+High-value customer classification
+KYC compliance flags
+
+>>>>>>>>>>>>>>job bookmarking internal working for incremental loads
+
+When bookmarking is enabled, AWS Glue stores metadata in:
+AWS Glue Data Catalog (hidden tables)
+
+S3 Source (most common)
+Glue tracks:
+S3 file paths
+Last modified timestamps
+
+JDBC Source (RDS, Redshift, etc.)
+Glue bookmarks track:
+High watermark column 
+stored metadata -last_processed_value = '2026-01-05 10:45:00'
+On next run:
+internally processes data with filter ----
+SELECT * FROM table
+WHERE updated_at > last_processed_value
+
+>>>>>>>>>>
+When Should You Use DynamicFrame?
+
+✅ Use DynamicFrame when:
+
+Reading from Glue Catalog
+Raw / Bronze layer ingestion
+JSON / semi-structured data
+Schema is unknown or evolving
+Using Glue bookmarks
+
+❌ Avoid DynamicFrame when:
+Heavy transformations
+Performance-critical jobs
+Writing Iceberg / Delta
+Complex SQL logic
+
+use  DynamicFrame - ResolveChoice - in bronze read when bronze source data has string and int for same fields
+resolve it and then convert it to df elese it fails (handle schema drifting)
+
+>>>>>>>>When Should You Use Spark DataFrame?
+
+✅ Use Spark DataFrame when:
+Silver / Gold layer transformations
+Joins, aggregations, dedup
+Window functions
+Iceberg MERGE, UPSERT
+Optimizing performance
+Writing production-grade pipelines
+
+>>>>>>>>>>>>>>glue architecture
+Data Sources (Input Layer)
+Glue can read data from almost anywhere:
+Common Sources
+Amazon S3 (most common – raw/bronze layer)
+RDS / Aurora
+DynamoDB
+Redshift
+JDBC sources (Postgres, MySQL, Oracle)
+Streaming (Kinesis, Kafka – via Glue Streaming Jobs)
+
+👉 Usually event-driven via:
+S3 event → Lambda → Glue job
+Step Functions orchestration
+Scheduled via Glue Triggers
+
+a) Glue Data Catalog
+
+Central metadata repository
+Stores:
+Databases
+Tables
+Schemas
+Partition information
+
+Used by:
+Glue
+Athena
+Redshift Spectrum
+EMR
+
+b)Crawlers
+
+Scan data sources
+Infer schema & partitions
+Populate Data Catalog
+Detect schema evolution (new columns)
+
+Best Practice
+Use crawler only for initial discovery
+Use explicit schema in production pipelines
+
+>>>>>>>>>>>data quality checks 
+null value checks
+typecasting
+
+biz level transformations
+derivation of columns
+standardized output structure
+
+>>>>>>> Object locking/RBAC for DE
+
+Key Principle:
+Least Privilege + Separation of Duties
+
+“Object Lock is mandatory for Bronze in regulated domains to ensure source immutability.”
+
+Silver & Gold
+Usually NOT enabled
+
+Typical DE permissions
+| Layer  | Access       |
+| ------ | ------------ |
+| Bronze | Read-only    |
+| Silver | Read / Write |
+| Gold   | Read-only    |
+
+
+>>>
+Glue Job Execution Role
+Separate IAM role per environment
+
+Permissions:
+Read from Bronze
+Write to Silver/Gold
+Access Glue Catalog
+CloudWatch logging
+
+DE Personal Access
+Can:
+Create/update Glue jobs
+View logs
+Cannot:
+Delete production data
+
+>>>>>>>>>>>>>>>>> AWS lakehouse formation
+
+AWS Lake Formation is a centralized data governance and access-control service for data lakes on AWS
+
+It does NOT store data
+It does NOT process data
+It controls who can see and do what with data stored in S3 and cataloged in Glue.
+
+Without Lake Formation
+Permissions are controlled using:
+S3 bucket policies
+IAM policies
+
+Problems:
+Coarse-grained (bucket-level)
+Hard to manage at scale
+No column-level security
+No row-level filters
+Security logic duplicated everywhere
+
+With Lake Formation
+You get:
+Database / table / column-level permissions
+Central governance
+One-time permission definition
+Works across Glue, Athena, Redshift Spectrum, EMR
+
+
+“Glue Catalog is metadata; Lake Formation enforces who can use that metadata.”
+
+Lake Formation + glue job
+Glue Job Execution Roles
+Must be explicitly granted permissions in Lake Formation:
+READ on Bronze
+WRITE on Silver/Gold
+
+If not:
+Glue job fails with permission error
+Even if IAM allows S3 access
+
+📌 Key concept:
+“Lake Formation permissions override IAM for registered locations.”
+
+Lake Formation + Iceberg Tables (CRITICAL)
+How Lake Formation Helps
+Table-level permissions on Iceberg tables
+Column-level masking on sensitive fields
+Safe concurrent access
+
+When SHOULD You Use Lake Formation
+Strong YES When:
+Multiple teams access same lake
+Sensitive data (banking, PII)
+Iceberg or transactional tables
+Athena / Redshift / Glue all used
+
+Overkill When:
+Single team
+No sensitive data
+Simple pipelines
+
+---
+Let’s assume:
+
+Input size: 500 GB
+Format: Parquet
+Stored in S3
+Moderate transformations + joins
+Target: Iceberg / Parquet
+SLA: < 1 hour
+
+1 Spark core can process ~100–150 MB/sec
+
+500 GB ≈ 512,000 MB
+512,000 / 150 ≈ 3,413 seconds ≈ 57 minutes on 1 core
+
+3413 / 15 ≈ 228 cores
+
+Total data blocks ≈ 500 GB / 128 MB ≈ ~4,000 partitions
+
+spark.executor.instances = 40
+spark.executor.cores = 4
+spark.executor.memory = 16g
+spark.executor.memoryOverhead = 4g
+total cores - 40 * 4 = 160 cores
+
+spark.sql.shuffle.partitions = 800
+spark.default.parallelism = 800
+
+spark.sql.shuffle.partitions = 800
+spark.default.parallelism = 800
+
+spark.sql.adaptive.enabled = true
+spark.sql.adaptive.coalescePartitions.enabled = true
+spark.sql.adaptive.skewJoin.enabled = true
+
+
+spark.serializer = org.apache.spark.serializer.KryoSerializer
+
+
+spark.sql.autoBroadcastJoinThreshold = 50MB
+
+40 × G.2X workers
+
+
+----
+sql trigger example
+--Blocks insertions of employees under 25, enforcing hiring policy at the database level.
+CREATE TRIGGER check_employee_age
+BEFORE INSERT ON employees
+FOR EACH ROW
+BEGIN
+    IF NEW.age < 25 THEN
+        SIGNAL SQLSTATE '45000' 
+        SET MESSAGE_TEXT = 'Employee age must be at least 25';
+    END IF;
+END;
+
+--Logs salary changes to an audit table whenever an employee record updates
+CREATE TRIGGER after_employee_update
+AFTER UPDATE ON employees
+FOR EACH ROW
+BEGIN
+    INSERT INTO employee_audit (employee_id, old_salary, new_salary, changed_date)
+    VALUES (OLD.employee_id, OLD.salary, NEW.salary, NOW());
+END;
+
+
+--
+
+NTILE() is a very helpful window function. It helps you to identify what percentile (or quartile, or any other subdivision) a given row falls into.
+
+This means that if you have 100 rows and you want to create 4 quartiles based on a specified value field you can do so easily and see how many rows fall into each quartile.
+
+Let’s see an example. In the query below, we have specified that we want to create four quartiles based on order amount. We then want to see how many orders fall into each quartile.
+ 
+SELECT order_id,order_date,customer_name,city, order_amount,
+NTILE(4) OVER(ORDER BY order_amount) [row_number]
+FROM [dbo].[Orders]
+
+
+Here is our example, 
+we have total 10 rows and 4 tiles are specified in the query so number of rows in each tile will be 2.5 (10/4). As number of rows should be whole number, not a decimal. SQL engine will assign 3 rows for first two groups and 2 rows for remaining two groups.
+
+
+----- native python functions
+
+read csv python
+import csv
+
+def read_csv(path):
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            yield row
+			
+----
+
+Aggregates values per key incrementally without storing full dataset.
+
+from collections import defaultdict
+
+agg = defaultdict(int)
+for r in read_csv("data.csv"):
+    agg[r["country"]] += int(r["sales"])
+	
+	-----------
+	
+Removes duplicate records based on a unique identifier.
+
+seen, unique = set(), []
+
+for r in records:
+    if r["id"] not in seen:
+        seen.add(r["id"])
+        unique.append(r)
+----
+Prevents pipeline failure due to bad numeric values.
+
+def to_int(v, default=0):
+    try:
+        return int(v)
+    except:
+        return default
+-------------
+def valid(r):
+    return r.get("email") not in (None, "", "NULL")
+	
+----------
+
+Converts timestamps into a standard timezone (UTC).
+
+from datetime import timezone
+dt = dt.astimezone(timezone.utc)
+
+----------
+
+Avoids accidental overwrites.
+
+import os
+if os.path.exists("out.csv"):
+    raise Exception("Already processed")
+----
+
+Finds highest values efficiently without full sort.
+
+import heapq
+heapq.nlargest(5, data, key=lambda x: x["sales"])
+
+
+Filters records without materializing a list.
+
+(r for r in data if r["active"])
+
+-----
+Default value with dict.get()
+
+Avoids KeyError and keeps pipelines resilient.
+
+amount = record.get("amount", 0)
+
+----pytest test cases
+Example function to test
+# transformations.py
+from pyspark.sql.functions import col
+
+def filter_active_users(df):
+    return df.filter(col("is_active") == True)
+---------
+Test using pytest
+# test_transformations.py
+import pytest
+from pyspark.sql import SparkSession
+from transformations import filter_active_users
+
+@pytest.fixture(scope="session")
+def spark():
+    return SparkSession.builder \
+        .master("local[2]") \
+        .appName("unit-tests") \
+        .getOrCreate()
+
+def test_filter_active_users(spark):
+    input_data = [
+        (1, True),
+        (2, False),
+        (3, True)
+    ]
+    input_df = spark.createDataFrame(input_data, ["user_id", "is_active"])
+
+    result_df = filter_active_users(input_df)
+
+    result = [row.user_id for row in result_df.collect()]
+    assert result == [1, 3]
+
+
+✅ What this tests
+
+Data correctness
+Transformation logic
+No cluster required
+---------
+
+
+df.explain() --- prod uses 
+
+1) issue & solution
+fact 500 gb
+dim 5 mb
+df = fact.join(dim, "customer_id")
+df.explain(True)
+
+SortMergeJoin [customer_id], [customer_id], Inner
+:- Exchange hashpartitioning(customer_id, 200)
+:- Exchange hashpartitioning(customer_id, 200)
+
+optimize
+
+from pyspark.sql.functions import broadcast
+
+df = transactions.join(broadcast(customers), "customer_id")
+df.explain(True)
+
+new plan
+BroadcastHashJoin [customer_id], [customer_id], Inner
+:- Scan parquet transactions
+:- BroadcastExchange
+
+2) issue & solution
+>>>> predicate pushdown not happening
+df = spark.read.parquet("s3://bucket/transactions/")
+filtered = df.filter(df.txn_date >= "2025-01-01")
+filtered.explain(True)
+
+PushedFilters: []
+ReadSchema: struct<50 columns>
+
+--optimised plan
+
+df = (
+    spark.read.parquet("s3://bucket/transactions/")
+    .select("txn_id", "amount", "txn_date")
+    .filter("txn_date >= '2025-01-01'")
+)
+
+df.explain(True)
+PushedFilters: [IsNotNull(txn_date), GreaterThanOrEqual(txn_date, 2025-01-01)]
+ReadSchema: struct<txn_id, amount, txn_date>
+
+
+3) issue & solution
+
+
+---catalyst optimizer & project tungsten
+| Explain Section        | What to Look For        |
+| ---------------------- | ----------------------- |
+| Logical Plan           | Column pruning, filters |
+| Optimized Logical Plan | Predicate pushdown      |
+| Physical Plan          | Join type, shuffles     |
+| Exchange               | Shuffle = expensive     |
+| BroadcastExchange      | Good sign               |
+
+
+Catalyst optimizer is Spark’s brain 🧠
+
+What It Does
+
+Converts code → optimized execution plan
+
+Key Optimizations
+Predicate Pushdown
+Column Pruning
+Join Reordering
+Constant Folding
+Filter Pushdown
+
+Tungsten
+| Area                | Benefit             |
+| ------------------- | ------------------- |
+| Off-heap memory     | Less GC             |
+| Binary format       | Faster CPU          |
+| Whole-stage codegen | Fewer virtual calls |
+| Cache-friendly      | Faster execution    |
+
+
+Catalyst decides what to run efficiently, Tungsten decides how fast it runs.
+
+------------
+
+Mental Model First (Important)
+1 TB data means:
+Parquet/ORC (compressed): ~200–300 GB scan
+Shuffle amplification: 2×–4×
+Total IO handled: 600 GB – 1.2 TB
+So you size for shuffle, not raw data.
+
+------
+
+a realistic worker node-
+Node:
+- 16 GB RAM
+- 4 vCPU
+----
+Executors per node: 1
+executor-cores: 4
+executor-memory: 10–12 GB
+----
+Total shuffle size: ~800 GB
+Target shuffle partition size: 128–256 MB
+
+800/256 = 3200 partitions
+-------
+
+executor-cores = 4
+num-executors = 50
+Total cores = 200
+
+--------
+shuffle partitions = 2× to 4× total cores
+-----------------
+Final corrected configuration -
+Glue Cluster
+Workers: 50
+Per worker:
+  - 16 GB RAM
+  - 4 vCPU
+
+Spark
+spark.sql.shuffle.partitions = 800
+spark.sql.adaptive.enabled = true
+spark.sql.adaptive.skewJoin.enabled = true
+--num-executors 50
+--executor-cores 4
+--executor-memory 10g
+--driver-memory 8g
+
+
+------------------------------------------------------
+
+PROD vs NON prod
+AWS Organization (centralized billing)
+ ├── aws-nonprod-account
+ └── aws-prod-account
+
+GLUE IAM policy to accounts
+policy attached to prod role
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetJob",
+        "glue:GetJobs",
+        "glue:GetJobRun",
+        "glue:GetJobRuns"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": [
+        "glue:CreateJob",
+        "glue:UpdateJob",
+        "glue:DeleteJob",
+        "glue:StartJobRun"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+IAM in NON-PROD account (Full Glue Access)
+{
+  "Effect": "Allow",
+  "Action": "glue:*",
+  "Resource": "*"
+}
+
+------------------------
+S3 IAM policy to accounts
+Non-Prod Account
+  s3://banking-nonprod-raw
+  s3://banking-nonprod-curated
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:ListBucket"
+  ],
+  "Resource": [
+    "arn:aws:s3:::banking-nonprod-*",
+    "arn:aws:s3:::banking-nonprod-*/*"
+  ]
+}
+
+
+Prod Account
+  s3://banking-prod-raw
+  s3://banking-prod-curated
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:ListBucket"
+  ],
+  "Resource": [
+    "arn:aws:s3:::banking-prod-*",
+    "arn:aws:s3:::banking-prod-*/*"
+  ]
+}
+
+-----------
+Non-Prod Glue Job → Non-Prod DB only (Never PROD)
+
+Layer 1: Network Isolation (VPC)
+Non-Prod VPC
+ ├── Non-Prod RDS / Redshift
+ └── Non-Prod Glue Connection
+
+Prod VPC
+ ├── Prod RDS / Redshift
+ └── Prod Glue Connection
+ 
+ Layer 2: Secrets Manager Isolation
+aws-nonprod-account
+  secret: nonprod/db/credentials
+
+aws-prod-account
+  secret: prod/db/credentials
+  
+ -----------------------------
+Glue job IAM role:
+
+{
+  "Effect": "Allow",
+  "Action": "secretsmanager:GetSecretValue",
+  "Resource": "arn:aws:secretsmanager:*:*:secret:nonprod/*"
+}
+
+
+❌ No access to prod/* secrets
+-------------------------------
+Layer 3: IAM Role per Environment (BEST PRACTICE)
+GlueNonProdExecutionRole
+GlueProdExecutionRole
+
+
+Each role:
+scoped to its own DB
+scoped to its own S3
+scoped to its own secrets
+-------------------------------
+---------------- Read from db and write to glue catalog
+
+DB2 Table
+  ↓
+Glue JDBC Connection (only for schema discovery, connection discovery when used in glue jdbc crawler)
+| Field           | Value                          |
+| --------------- | ------------------------------ |
+| Connection type | JDBC                           |
+| Database type   | **DB2**                        |
+| JDBC URL        | `jdbc:db2://host:50000/DBNAME` |
+| Username        | db2_user                       |
+| Password        | from Secrets Manager           |
+| VPC             | Same as DB2                    |
+| Subnet          | Private                        |
+| Security group  | Allow outbound 50000           |
+
+  ↓
+Glue Job (DB2 → Bronze)
+read jdbc -- read only lastest data everytime 
+
+query = f"""
+(
+  SELECT *
+  FROM SCHEMA.BANK_TXN
+  WHERE LAST_UPDATED_TS > TIMESTAMP('{last_ts}')
+) AS txn
+"""
+
+incremental_df = (
+    spark.read
+    .format("jdbc")
+    .option("url", "jdbc:db2://host:50000/DBNAME")
+    .option("dbtable", query)
+    .option("user", "db2_user")
+    .option("password", "********")
+    .option("driver", "com.ibm.db2.jcc.DB2Driver")
+    .load()
+)
+
+write to bronze s3 , with bronze audit columns, partitioned by date
+
+update watermark value
+
+from pyspark.sql.functions import max
+
+new_ts = incremental_df.agg(
+    max("LAST_UPDATED_TS")
+).collect()[0][0]
+
+  ↓
+create bronze crawler 
+read from s3
+write to bronze db.table
+
+  ↓
+Glue Job (Bronze → Silver)
+read bronze table
+dedup
+null checks
+data quality 
+write to silver
+
+  ↓
+S3 Silver (clean, deduped, business-ready)
+
+---- orchstrate entire pipeline
+Create Step Functions State Machine -- can add mail notifications for each task
+
+standard(can run upto 1 year) vs express(can run upto 5 mins) 
+
+{
+  "Comment": "DB2 to Bronze to Silver pipeline",
+  "StartAt": "DB2ToBronze",
+  "States": {
+    "DB2ToBronze": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "db2_to_bronze_job"
+      },
+      "Next": "RunBronzeCrawler"
+    },
+-----------------------------------------------------------
+    "RunBronzeCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": {
+        "Name": "bronze_s3_crawler"
+      },
+      "Next": "WaitForCrawler"
+    },
+------------------------------------------------------------
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "CheckCrawlerStatus"
+    },
+
+    "CheckCrawlerStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": {
+        "Name": "bronze_s3_crawler"
+      },
+      "Next": "CrawlerFinished?"
+    },
+--------------------------------------------
+    "CrawlerFinished?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "BronzeToSilver"
+        }
+      ],
+      "Default": "WaitForCrawler"
+    },
+---------------------------------------------------------
+    "BronzeToSilver": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "bronze_to_silver_job"
+      },
+      "End": true
+    }
+  }
+}
+-------
+attach IAM roles to to this state machine to hot glue etc
+>>>>>>>>>>>>>>>>>>>>>>>
+
+Create EventBridge Schedule (Automation)
+
+Amazon EventBridge
+>>Click Rules
+>>Click Create scheduled rule
+
+add above created stepfunction to rule target
+and set it
+
+| Service            | What you monitor there                    |
+| ------------------ | ----------------------------------------- |
+| **EventBridge**    | Did the schedule fire?                    |
+| **Step Functions** | End-to-end pipeline progress (MAIN PLACE) |
+| **CloudWatch**     | Detailed logs & metrics                   |
+
+
+
+retries -- 
+
+"DB2ToBronze": {
+  "Type": "Task",
+  "Resource": "arn:aws:states:::glue:startJobRun.sync",
+  "Parameters": {
+    "JobName": "db2_to_bronze_job"
+  },
+  "Retry": [
+    {
+      "ErrorEquals": ["States.ALL"],
+      "IntervalSeconds": 120,
+      "BackoffRate": 2.0,
+      "MaxAttempts": 3
+    }
+  ],
+  "Catch": [
+    {
+      "ErrorEquals": ["States.ALL"],
+      "Next": "NotifyFailure"
+    }
+  ],
+  "Next": "RunBronzeCrawler"
+}
+
+
+notifications -
+"NotifyFailure": {
+  "Type": "Task",
+  "Resource": "arn:aws:states:::sns:publish",
+  "Parameters": {
+    "TopicArn": "arn:aws:sns:REGION:ACCOUNT_ID:data-pipeline-alerts",
+    "Subject": "❌ Data Pipeline Failed",
+    "Message": {
+      "Error": "Pipeline step failed",
+      "ExecutionName.$": "$$.Execution.Name",
+      "StateMachine.$": "$$.StateMachine.Name",
+      "FailedStepInput.$": "$"
+    }
+  },
+  "End": true
+}
+
+
+"NotifySuccess": {
+  "Type": "Task",
+  "Resource": "arn:aws:states:::sns:publish",
+  "Parameters": {
+    "TopicArn": "arn:aws:sns:REGION:ACCOUNT_ID:data-pipeline-alerts",
+    "Subject": "✅ Data Pipeline Success",
+    "Message": {
+      "Message": "DB2 → Bronze → Silver pipeline completed successfully",
+      "ExecutionName.$": "$$.Execution.Name",
+      "StateMachine.$": "$$.StateMachine.Name"
+    }
+  },
+  "End": true
+}
+-----------integrate with pipeline task
+
+"DB2ToBronze": {
+  "Type": "Task",
+  "Resource": "arn:aws:states:::glue:startJobRun.sync",
+  "Parameters": {
+    "JobName": "db2_to_bronze_job"
+  },
+  "Retry": [
+    {
+      "ErrorEquals": ["States.ALL"],
+      "IntervalSeconds": 120,
+      "BackoffRate": 2.0,
+      "MaxAttempts": 3
+    }
+  ],
+  "Catch": [
+    {
+      "ErrorEquals": ["States.ALL"],
+      "Next": "NotifyFailure"
+    }
+  ],
+  "Next": "RunBronzeCrawler"
+}
+
+
+---- last task successfully
+"BronzeToSilver": {
+  "Type": "Task",
+  "Resource": "arn:aws:states:::glue:startJobRun.sync",
+  "Parameters": {
+    "JobName": "bronze_to_silver_job"
+  },
+  "Catch": [
+    {
+      "ErrorEquals": ["States.ALL"],
+      "Next": "NotifyFailure"
+    }
+  ],
+  "Next": "NotifySuccess"
+}
+------------
+
+Transformations on Customer transactions Related Data
+
+Standardization & Canonicalization
+Goal: Make all channels look the same
+===============================
+Transaction Type Classification
+====================================
+Aggregations
+Goal: Analytics-ready datasets
+
+Examples
+Daily spend per channel
+Monthly inflow/outflow
+Merchant-wise spend
+
+====================================
+Transformations on Customer Account Related Data
+
+
+Risk & Compliance Transformations
+
+Goal: Regulatory readiness
+Risk scoring normalization
+KYC completeness flags
+Sanction screening flags
+Dormancy & Churn Detection

@@ -1,0 +1,328 @@
+--usp_process_orders
+
+SET NOCOUNT ON;
+
+CREATE PROCEDURE usp_process_orders
+    @run_date DATE
+AS
+BEGIN -- starting point
+    SET NOCOUNT ON; -- prevents displaying “(12543 rows affected)”
+
+    -- Step 1: Stage recent orders
+	-- Categorizes each order based on amount
+	-- Creates a derived column called order_value_band
+    SELECT
+        o.order_id,
+        o.customer_id,
+        o.order_date,
+        o.amount,
+        CASE
+            WHEN o.amount >= 10000 THEN 'HIGH'
+            WHEN o.amount >= 5000 THEN 'MEDIUM'
+            ELSE 'LOW'
+        END AS order_value_band
+    INTO #stg_orders -- Creates a temporary table, Name starts with # → session-scoped temp table
+    FROM orders o
+    WHERE o.order_date >= DATEADD(day, -30, @run_date);
+	-- Keeps only orders from the last 30 days, sliding window
+
+    -- Step 2: Aggregate per customer
+    SELECT
+        customer_id,
+        COUNT(*) AS total_orders,
+        SUM(amount) AS total_amount,
+        MAX(order_date) AS last_order_date
+    INTO #cust_summary -- temp table
+    FROM #stg_orders
+    GROUP BY customer_id;
+
+    -- Step 3: Conditional logic
+    UPDATE c -- You are modifying existing rows from customers table
+    SET customer_type =
+        CASE
+            WHEN cs.total_amount >= 50000 THEN 'PLATINUM'
+            WHEN cs.total_amount >= 20000 THEN 'GOLD'
+            ELSE 'REGULAR'
+        END
+    FROM customers c
+    JOIN #cust_summary cs
+        ON c.customer_id = cs.customer_id;
+
+    -- Step 4: Insert audit
+    INSERT INTO etl_audit_log
+    VALUES ('usp_process_orders', @run_date, GETDATE(), 'SUCCESS');
+END;
+
+---------------------------------------------------
+Spark conversion -
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+run_date = "2024-01-31"
+orders_df = spark.table("orders")
+customers_df = spark.table("customers")
+
+stg_orders_df = (
+    orders_df
+    .filter(F.col("order_date") >= F.date_sub(F.lit(run_date), 30))
+    .withColumn(
+        "order_value_band",
+        F.when(F.col("amount") >= 10000, "HIGH")
+         .when(F.col("amount") >= 5000, "MEDIUM")
+         .otherwise("LOW")
+    )
+    .select(
+        "order_id",
+        "customer_id",
+        "order_date",
+        "amount",
+        "order_value_band"
+    )
+)
+
+cust_summary_df = (
+    stg_orders_df
+    .groupBy("customer_id")
+    .agg(
+        F.count("*").alias("total_orders"),
+        F.sum("amount").alias("total_amount"),
+        F.max("order_date").alias("last_order_date")
+    )
+)
+
+updated_customers_df = (
+    customers_df.alias("c")
+    .join(
+        cust_summary_df.alias("cs"),
+        F.col("c.customer_id") == F.col("cs.customer_id"),
+        "left"
+    )
+    .withColumn(
+        "customer_type",
+        F.when(F.col("cs.total_amount") >= 50000, "PLATINUM")
+         .when(F.col("cs.total_amount") >= 20000, "GOLD")
+         .otherwise("REGULAR")
+    )
+    .select("c.*", "customer_type")
+)
+-- write to gold table
+(
+    updated_customers_df
+    .write
+    .mode("overwrite")   # or MERGE INTO if Delta
+    .format("delta")
+    .saveAsTable("customers")
+)
+-- audit logging
+audit_df = spark.createDataFrame(
+    [("usp_process_orders", run_date, "SUCCESS")],
+    ["job_name", "run_date", "status"]
+).withColumn("processed_at", F.current_timestamp())
+
+audit_df.write.mode("append").saveAsTable("etl_audit_log")
+---------------------------------------------------------------
+
+Banking Use case - 
+Use case: Daily Loan Delinquency & Risk Classification- 
+Loan payment date - 1st Jan
+|-----------------------------|
+| Date   | Daily delinquency  |
+| ------ | ------------------ |
+| 2 Jan  | 1 day delinquent   |
+| 5 Jan  | 4 days delinquent  |
+| 31 Jan | 30 days delinquent |
+|-----------------------------|
+
+CREATE PROCEDURE usp_daily_loan_delinquency
+    @run_date DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /* Step 1: Get latest due information */
+    SELECT
+        l.loan_account_id,
+        l.customer_id,
+        l.product_code,
+        l.outstanding_amount,
+        d.due_date,
+        DATEDIFF(day, d.due_date, @run_date) AS dpd
+    INTO #loan_due -- temp table
+    FROM loan_accounts l
+    JOIN loan_due_schedule d
+        ON l.loan_account_id = d.loan_account_id
+    WHERE d.is_latest = 'Y';
+
+    /* Step 2: Bucket classification */
+    SELECT
+        *,
+        CASE
+            WHEN dpd <= 0 THEN 'CURRENT'
+            WHEN dpd BETWEEN 1 AND 30 THEN 'DPD_1_30'
+            WHEN dpd BETWEEN 31 AND 90 THEN 'DPD_31_90'
+            ELSE 'NPA'
+        END AS delinquency_bucket
+    INTO #loan_bucketed
+    FROM #loan_due;
+
+    /* Step 3: Risk escalation */
+    UPDATE la
+    SET
+        la.risk_status =
+            CASE
+                WHEN lb.delinquency_bucket = 'NPA' THEN 'HIGH'
+                WHEN lb.delinquency_bucket = 'DPD_31_90' THEN 'MEDIUM'
+                ELSE 'LOW'
+            END,
+        la.last_delinquency_date = @run_date
+    FROM loan_accounts la
+    JOIN #loan_bucketed lb
+        ON la.loan_account_id = lb.loan_account_id;
+
+    /* Step 4: SCD history */
+    INSERT INTO loan_delinquency_history
+    SELECT
+        loan_account_id,
+        delinquency_bucket,
+        @run_date AS effective_from,
+        '9999-12-31' AS effective_to
+    FROM #loan_bucketed;
+
+END;
+
+spark ---
+🔹 Step 0: Read only required columns (huge perf win)
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+run_date = "2024-01-31"
+
+loan_df = (
+    spark.table("loan_accounts")
+    .select(
+        "loan_account_id",
+        "customer_id",
+        "product_code",
+        "outstanding_amount"
+    )
+)
+
+due_df = (
+    spark.table("loan_due_schedule")
+    .filter(F.col("is_latest") == "Y")
+    .select("loan_account_id", "due_date")
+)
+
+🔹 Step 1: Loan due calculation (NO temp tables)
+
+loan_due_df = (
+    loan_df
+    .join(due_df, "loan_account_id", "inner")
+    .withColumn(
+        "dpd",
+        F.datediff(F.lit(run_date), F.col("due_date"))
+    )
+)
+
+🔹 Step 2: Bucketing (vectorised, JVM-level)
+
+bucketed_df = (
+    loan_due_df
+    .withColumn(
+        "delinquency_bucket",
+        F.when(F.col("dpd") <= 0, "CURRENT")
+         .when(F.col("dpd").between(1, 30), "DPD_1_30")
+         .when(F.col("dpd").between(31, 90), "DPD_31_90")
+         .otherwise("NPA")
+    )
+)
+
+🔹 Step 3: Replace UPDATE with rebuild + MERGE (Delta)
+
+final_loan_df = (
+    loan_df.alias("la")
+    .join(
+        bucketed_df.select(
+            "loan_account_id", "delinquency_bucket"
+        ).alias("lb"),
+        "loan_account_id",
+        "left"
+    )
+    .withColumn(
+        "risk_status",
+        F.when(F.col("lb.delinquency_bucket") == "NPA", "HIGH")
+         .when(F.col("lb.delinquency_bucket") == "DPD_31_90", "MEDIUM")
+         .otherwise("LOW")
+    )
+    .withColumn("last_delinquency_date", F.lit(run_date))
+    .drop("delinquency_bucket")
+)
+
+🔹 Step 4: Delta MERGE (Bank-safe pattern)
+MERGE INTO loan_accounts t
+USING final_loan_df s
+ON t.loan_account_id = s.loan_account_id
+WHEN MATCHED THEN UPDATE SET *
+
+Step 5: SCD-2 History (Correct Banking Way)
+history_df = (
+    bucketed_df
+    .select(
+        "loan_account_id",
+        "delinquency_bucket"
+    )
+    .withColumn("effective_from", F.lit(run_date))
+    .withColumn("effective_to", F.lit("9999-12-31"))
+)
+
+
+history_df.write.mode("append").saveAsTable("loan_delinquency_history")
+
+---------------
+
+Heavy Spark Optimisations (This Is the Gold)
+🔥 1. Broadcast small reference tables
+bucketed_df = loan_due_df.join(
+    F.broadcast(due_df), "loan_account_id"
+)
+
+Used when:
+
+Due schedule << loan accounts
+
+🔥 2. Handle data skew (very common in banking)
+
+Problem
+
+Some customers have 1000s of loans
+
+One partition becomes hot
+
+Fix
+
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+🔥 3. Partition strategy (absolutely critical)
+CREATE TABLE loan_delinquency_history (
+  ...
+)
+PARTITIONED BY (effective_from)
+
+Query by date = 100× faster
+
+Regulators always query by date
+
+🔥 4. Z-ORDER (Delta only)
+OPTIMIZE loan_accounts
+ZORDER BY (loan_account_id)
+
+🚀 Massive speedup for joins & merges
+
+🔥 5. Incremental processing (banking MUST)
+
+Instead of full table scans:
+
+loan_df = loan_df.filter(
+    F.col("last_modified_date") >= F.date_sub(run_date, 1)
+)
